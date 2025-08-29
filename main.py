@@ -156,6 +156,10 @@ def evaluate_signals(df: pd.DataFrame,
 def health():
     return {"status": "ok", "timestamp": int(time.time())}
 
+@app.get("/")
+def root():
+    return {"message": "Olymp Signal Backend is alive! Try /signal or /batch_signals."}
+
 @app.get("/signal")
 def get_signal(symbol: str = Query(..., description="TwelveData symbol e.g. EUR/USD or EURUSD"),
                interval: str = "1min",

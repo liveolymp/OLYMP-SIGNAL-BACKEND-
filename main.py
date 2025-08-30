@@ -1,125 +1,92 @@
 import os
 import time
-from typing import List
-from fastapi import FastAPI, HTTPException, Query
 import requests
 import pandas as pd
 import numpy as np
+from typing import Dict, List
+from fastapi import FastAPI
+import uvicorn
 
-# === YOUR TWELVEDATA API KEY ===
+app = FastAPI()
+
 TWELVEDATA_API_KEY = "a24ff933811047d994b9e76f1e"
+SYMBOLS = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+    "AUD/USD", "NZD/USD", "USD/CAD", "EUR/JPY"
+]
+INTERVAL = "1min"
 
-# === FASTAPI APP ===
-app = FastAPI(title="AI Signal Engine", description="Fancy Futuristic Signal API 🚀")
-
-# === TECHNICAL INDICATORS ===
-def momentum(series, length=10):
-    return series.diff(length)
-
-def rsi(series, length=14):
-    delta = series.diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(length).mean()
-    avg_loss = pd.Series(loss).rolling(length).mean()
+# === Indicators ===
+def calculate_rsi(data: pd.Series, period: int = 14):
+    delta = data.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(com=period-1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period-1, adjust=False).mean()
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def ao(high, low, short=5, long=34):
-    median_price = (high + low) / 2
-    short_ma = median_price.rolling(short).mean()
-    long_ma = median_price.rolling(long).mean()
-    return short_ma - long_ma
+def calculate_momentum(data: pd.Series, period: int = 10):
+    return data.diff(period)
 
-def zigzag(df, deviation=5):
-    df["zz"] = np.nan
-    direction = None
-    last_pivot_idx = 0
-    last_pivot_price = df["close"].iloc[0]
+def calculate_ao(df: pd.DataFrame):
+    median_price = (df["high"] + df["low"]) / 2
+    sma5 = median_price.rolling(5).mean()
+    sma34 = median_price.rolling(34).mean()
+    return sma5 - sma34
 
-    for i in range(1, len(df)):
-        price = df["close"].iloc[i]
-        if direction is None:
-            if price >= last_pivot_price * (1 + deviation / 100):
-                direction = "UP"
-                last_pivot_price = price
-                last_pivot_idx = i
-                df.loc[df.index[i], "zz"] = price
-            elif price <= last_pivot_price * (1 - deviation / 100):
-                direction = "DOWN"
-                last_pivot_price = price
-                last_pivot_idx = i
-                df.loc[df.index[i], "zz"] = price
-        elif direction == "UP" and price <= last_pivot_price * (1 - deviation / 100):
-            direction = "DOWN"
-            last_pivot_price = price
-            last_pivot_idx = i
-            df.loc[df.index[i], "zz"] = price
-        elif direction == "DOWN" and price >= last_pivot_price * (1 + deviation / 100):
-            direction = "UP"
-            last_pivot_price = price
-            last_pivot_idx = i
-            df.loc[df.index[i], "zz"] = price
+def calculate_zigzag(df: pd.DataFrame, deviation: float = 0.5):
+    df['zigzag'] = np.where(df['close'] > df['close'].shift(1) * (1 + deviation/100), 1,
+                     np.where(df['close'] < df['close'].shift(1) * (1 - deviation/100), -1, 0))
+    return df['zigzag']
 
-    return df
-
-# === FETCH DATA FROM TWELVEDATA ===
-def fetch_data(symbol: str, interval: str = "1min", outputsize: int = 100):
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TWELVEDATA_API_KEY}&outputsize={outputsize}"
-    response = requests.get(url).json()
-    if "values" not in response:
-        raise HTTPException(status_code=400, detail="Error fetching data")
-    df = pd.DataFrame(response["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime")
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-    return df.reset_index(drop=True)
-
-# === SIGNAL GENERATOR ===
-def generate_signal(df):
-    df["ao"] = ao(df["high"], df["low"])
-    df["mom"] = momentum(df["close"], length=10)
-    df["rsi"] = rsi(df["close"], length=14)
-    df = zigzag(df)
+# === Signal Logic ===
+def check_signal(df: pd.DataFrame):
+    df["RSI"] = calculate_rsi(df["close"])
+    df["Momentum"] = calculate_momentum(df["close"])
+    df["AO"] = calculate_ao(df)
+    df["Zigzag"] = calculate_zigzag(df)
 
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
 
-    # Conditions
-    acc_flip_up = latest["ao"] > 0 and prev["ao"] <= 0
-    acc_flip_down = latest["ao"] < 0 and prev["ao"] >= 0
-    momentum_up = latest["mom"] > 0
-    momentum_down = latest["mom"] < 0
-    rsi_up = latest["rsi"] > 55
-    rsi_down = latest["rsi"] < 45
+    acc_flip = latest["AO"] > 0
+    mom_flip = latest["Momentum"] > 0
+    rsi_ok = 50 < latest["RSI"] < 60
+    zigzag_up = latest["Zigzag"] == 1
 
-    zz_direction = "UP" if latest["close"] >= df["zz"].dropna().iloc[-1] else "DOWN"
+    if acc_flip and mom_flip and rsi_ok and zigzag_up:
+        return "BUY"
+    elif not acc_flip and not mom_flip and latest["RSI"] < 50 and latest["Zigzag"] == -1:
+        return "SELL"
+    else:
+        return None
 
-    # Signal logic
-    signal = "HOLD"
-    if acc_flip_up and momentum_up and rsi_up and zz_direction == "UP":
-        signal = "BUY"
-    elif acc_flip_down and momentum_down and rsi_down and zz_direction == "DOWN":
-        signal = "SELL"
+def get_data(symbol: str, interval: str = INTERVAL, outputsize: int = 100):
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TWELVEDATA_API_KEY}&outputsize={outputsize}"
+    r = requests.get(url)
+    data = r.json()
+    if "values" not in data:
+        return None
+    df = pd.DataFrame(data["values"])
+    df = df.astype({"open": float, "high": float, "low": float, "close": float})
+    df = df[::-1].reset_index(drop=True)
+    return df
 
-    return {
-        "signal": signal,
-        "ao": float(latest["ao"]),
-        "momentum": float(latest["mom"]),
-        "rsi": float(latest["rsi"]),
-        "zigzag": zz_direction,
-        "price": float(latest["close"])
-    }
+def scan_markets():
+    signals = {}
+    for symbol in SYMBOLS:
+        df = get_data(symbol)
+        if df is not None:
+            signal = check_signal(df)
+            if signal:
+                signals[symbol] = signal
+    return signals
 
-# === API ENDPOINT ===
-@app.get("/signal")
-def get_signal(symbol: str = Query(...), interval: str = Query("1min")):
-    df = fetch_data(symbol, interval)
-    signal_data = generate_signal(df)
-    return {
-        "symbol": symbol,
-        "interval": interval,
-        "signal": signal_data["signal"],
-        "details": signal_data
-    }
+# === API Endpoint ===
+@app.get("/signals")
+def get_signals():
+    return {"signals": scan_markets()}
+
+# === Run Server ===
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

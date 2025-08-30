@@ -6,7 +6,7 @@ import requests
 import pandas as pd
 import numpy as np
 
-# === YOUR TWELVEDATA API KEY (embedded per your request) ===
+# === YOUR TWELVEDATA API KEY ===
 TWELVEDATA_API_KEY = "a24ff933811047d994b9e76f1e9d7280"
 
 if not TWELVEDATA_API_KEY:
@@ -14,7 +14,7 @@ if not TWELVEDATA_API_KEY:
 
 app = FastAPI(title="Olymp Signal Backend")
 
-# --- helper: fetch candles from TwelveData ---
+# --- Helper: fetch candles from TwelveData ---
 def fetch_td_series(symbol: str, interval: str = "1min", outputsize: int = 200) -> pd.DataFrame:
     base = "https://api.twelvedata.com/time_series"
     params = {
@@ -30,10 +30,16 @@ def fetch_td_series(symbol: str, interval: str = "1min", outputsize: int = 200) 
     j = r.json()
     if "values" not in j:
         raise HTTPException(status_code=502, detail=f"TwelveData response error: {j}")
+
     df = pd.DataFrame(j["values"]).iloc[::-1].reset_index(drop=True)
     df["datetime"] = pd.to_datetime(df["datetime"])
-    for c in ["open", "high", "low", "close", "volume"]:
+
+    # Only keep OHLC, ignore volume
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
+            raise HTTPException(status_code=502, detail=f"Missing {c} in response")
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
     return df
 
 # --- Indicators ---
@@ -73,7 +79,7 @@ def zigzag(df: pd.DataFrame, pct: float = 0.3):
     last_type = None
     threshold = pct / 100.0
     for i in range(1, n):
-        change = (close[i] - last_pivot) / (last_pivot if last_pivot!=0 else 1)
+        change = (close[i] - last_pivot) / (last_pivot if last_pivot != 0 else 1)
         if last_type in (None, 'low') and change >= threshold:
             zz[i] = 1
             last_pivot = close[i]
@@ -116,73 +122,35 @@ def evaluate_signals(df: pd.DataFrame,
     acc_flip_down = (prev_row['acc'] > 0) and (latest['acc'] < 0) and (latest['close'] < latest['open'])
 
     rsi_up = (latest['rsi'] > prev_row['rsi']) and (latest['rsi'] >= rsi_threshold)
-    rsi_down = (latest['rsi'] < prev_row['rsi']) and (latest['rsi'] <= (100 - rsi_threshold))
 
-    mom_flip_up = (prev_row['mom'] < 0) and (latest['mom'] > 0) and (latest['close'] > latest['open'])
-    mom_flip_down = (prev_row['mom'] > 0) and (latest['mom'] < 0) and (latest['close'] < latest['open'])
-
-    buy = all([zigzag_upper, acc_flip_up, rsi_up, mom_flip_up])
-    sell = all([zigzag_lower, acc_flip_down, rsi_down, mom_flip_down])
-
+    # --- Example signal logic ---
     signal = None
-    if buy:
+    if acc_flip_up and rsi_up and zigzag_lower:
         signal = "BUY"
-    elif sell:
+    elif acc_flip_down and not rsi_up and zigzag_upper:
         signal = "SELL"
-    else:
-        signal = "HOLD"
 
-    details = {
+    return {
         "signal": signal,
-        "zigzag_upper": bool(zigzag_upper),
-        "zigzag_lower": bool(zigzag_lower),
-        "acc_flip_up": bool(acc_flip_up),
-        "acc_flip_down": bool(acc_flip_down),
-        "rsi_up": bool(rsi_up),
-        "rsi_down": bool(rsi_down),
-        "mom_flip_up": bool(mom_flip_up),
-        "mom_flip_down": bool(mom_flip_down),
-        "latest_rsi": float(latest['rsi']),
-        "latest_acc": float(latest['acc']),
-        "latest_mom": float(latest['mom']),
-        "latest_close": float(latest['close']),
-        "latest_open": float(latest['open']),
+        "latest_close": latest["close"],
+        "rsi": latest["rsi"],
+        "ao": latest["ao"],
+        "acc": latest["acc"],
+        "momentum": latest["mom"]
     }
 
-    return details
-
-# --- API endpoints ---
-@app.get("/health")
-def health():
-    return {"status": "ok", "timestamp": int(time.time())}
-
-@app.get("/")
-def root():
-    return {"message": "Olymp Signal Backend is alive! Try /signal or /batch_signals."}
-
-@app.get("/signal")
-def get_signal(symbol: str = Query(..., description="TwelveData symbol e.g. EUR/USD or EURUSD"),
-               interval: str = "1min",
-               zigzag_pct: float = 0.3,
-               rsi_period: int = 14,
-               rsi_threshold: float = 52,
-               momentum_len: int = 10):
-    df = fetch_td_series(symbol, interval=interval, outputsize=200)
-    result = evaluate_signals(df,
-                              zigzag_pct=zigzag_pct,
-                              rsi_period=rsi_period,
-                              rsi_threshold=rsi_threshold,
-                              momentum_len=momentum_len)
-    return result
-
+# --- FastAPI Endpoint ---
 @app.get("/batch_signals")
-def batch_signals(symbols: str = Query(..., description="comma separated symbols, e.g. EUR/USD,GBP/USD,USD/JPY")):
-    out = {}
-    s_list = [s.strip() for s in symbols.split(",") if s.strip()]
-    for s in s_list:
+def batch_signals(symbols: str = Query(..., description="Comma-separated symbols, e.g. EUR/USD,GBP/USD")):
+    symbol_list = [s.strip() for s in symbols.split(",")]
+    results = {}
+
+    for sym in symbol_list:
         try:
-            df = fetch_td_series(s, interval="1min", outputsize=200)
-            out[s] = evaluate_signals(df)
+            df = fetch_td_series(sym)
+            sig = evaluate_signals(df)
+            results[sym] = sig
         except Exception as e:
-            out[s] = {"error": str(e)}
-    return out
+            results[sym] = {"error": str(e)}
+
+    return results

@@ -10,9 +10,12 @@ import uvicorn
 app = FastAPI()
 
 TWELVEDATA_API_KEY = "a24ff933811047d994b9e76f1e"
-SYMBOLS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-    "AUD/USD", "NZD/USD", "USD/CAD", "EUR/JPY"
+ASSETS = [
+    "EUR/USD", "GBP/USD", "AUD/USD", "USD/JPY",
+    "USD/CAD", "USD/CHF", "EUR/GBP", "AUD/CAD",
+    # OTC pairs
+    "EUR/USD OTC", "GBP/USD OTC", "AUD/USD OTC",
+    "USD/JPY OTC", "USD/CAD OTC", "USD/CHF OTC"
 ]
 INTERVAL = "1min"
 

@@ -7,150 +7,119 @@ import pandas as pd
 import numpy as np
 
 # === YOUR TWELVEDATA API KEY ===
-TWELVEDATA_API_KEY = "a24ff933811047d994b9e76f1e9d7280"
+TWELVEDATA_API_KEY = "a24ff933811047d994b9e76f1e"
 
-if not TWELVEDATA_API_KEY:
-    print("WARNING: TWELVEDATA_API_KEY not set. Set env var TWELVEDATA_API_KEY before production.")
+# === FASTAPI APP ===
+app = FastAPI(title="AI Signal Engine", description="Fancy Futuristic Signal API 🚀")
 
-app = FastAPI(title="Olymp Signal Backend")
+# === TECHNICAL INDICATORS ===
+def momentum(series, length=10):
+    return series.diff(length)
 
-# --- Helper: fetch candles from TwelveData ---
-def fetch_td_series(symbol: str, interval: str = "1min", outputsize: int = 200) -> pd.DataFrame:
-    base = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "format": "JSON",
-        "apikey": TWELVEDATA_API_KEY,
-    }
-    r = requests.get(base, params=params, timeout=15)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"TwelveData error: {r.status_code}")
-    j = r.json()
-    if "values" not in j:
-        raise HTTPException(status_code=502, detail=f"TwelveData response error: {j}")
+def rsi(series, length=14):
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(length).mean()
+    avg_loss = pd.Series(loss).rolling(length).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-    df = pd.DataFrame(j["values"]).iloc[::-1].reset_index(drop=True)
-    df["datetime"] = pd.to_datetime(df["datetime"])
+def ao(high, low, short=5, long=34):
+    median_price = (high + low) / 2
+    short_ma = median_price.rolling(short).mean()
+    long_ma = median_price.rolling(long).mean()
+    return short_ma - long_ma
 
-    # Only keep OHLC, ignore volume
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            raise HTTPException(status_code=502, detail=f"Missing {c} in response")
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+def zigzag(df, deviation=5):
+    df["zz"] = np.nan
+    direction = None
+    last_pivot_idx = 0
+    last_pivot_price = df["close"].iloc[0]
+
+    for i in range(1, len(df)):
+        price = df["close"].iloc[i]
+        if direction is None:
+            if price >= last_pivot_price * (1 + deviation / 100):
+                direction = "UP"
+                last_pivot_price = price
+                last_pivot_idx = i
+                df.loc[df.index[i], "zz"] = price
+            elif price <= last_pivot_price * (1 - deviation / 100):
+                direction = "DOWN"
+                last_pivot_price = price
+                last_pivot_idx = i
+                df.loc[df.index[i], "zz"] = price
+        elif direction == "UP" and price <= last_pivot_price * (1 - deviation / 100):
+            direction = "DOWN"
+            last_pivot_price = price
+            last_pivot_idx = i
+            df.loc[df.index[i], "zz"] = price
+        elif direction == "DOWN" and price >= last_pivot_price * (1 + deviation / 100):
+            direction = "UP"
+            last_pivot_price = price
+            last_pivot_idx = i
+            df.loc[df.index[i], "zz"] = price
 
     return df
 
-# --- Indicators ---
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / (avg_loss.replace(0, 1e-8))
-    rsi_vals = 100 - (100 / (1 + rs))
-    return rsi_vals
+# === FETCH DATA FROM TWELVEDATA ===
+def fetch_data(symbol: str, interval: str = "1min", outputsize: int = 100):
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TWELVEDATA_API_KEY}&outputsize={outputsize}"
+    response = requests.get(url).json()
+    if "values" not in response:
+        raise HTTPException(status_code=400, detail="Error fetching data")
+    df = pd.DataFrame(response["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime")
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    return df.reset_index(drop=True)
 
-def sma(series: pd.Series, length: int) -> pd.Series:
-    return series.rolling(window=length).mean()
+# === SIGNAL GENERATOR ===
+def generate_signal(df):
+    df["ao"] = ao(df["high"], df["low"])
+    df["mom"] = momentum(df["close"], length=10)
+    df["rsi"] = rsi(df["close"], length=14)
+    df = zigzag(df)
 
-def awesome_oscillator(df: pd.DataFrame, s=5, l=34) -> pd.Series:
-    median = (df['high'] + df['low']) / 2
-    ao = median.rolling(window=s).mean() - median.rolling(window=l).mean()
-    return ao
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
-def accelerator_oscillator(df: pd.DataFrame) -> pd.Series:
-    ao = awesome_oscillator(df)
-    ao_sma5 = ao.rolling(window=5).mean()
-    acc = ao - ao_sma5
-    return acc
+    # Conditions
+    acc_flip_up = latest["ao"] > 0 and prev["ao"] <= 0
+    acc_flip_down = latest["ao"] < 0 and prev["ao"] >= 0
+    momentum_up = latest["mom"] > 0
+    momentum_down = latest["mom"] < 0
+    rsi_up = latest["rsi"] > 55
+    rsi_down = latest["rsi"] < 45
 
-def momentum(series: pd.Series, length: int = 10) -> pd.Series:
-    return series.diff(periods=length)
+    zz_direction = "UP" if latest["close"] >= df["zz"].dropna().iloc[-1] else "DOWN"
 
-# ZigZag simple implementation
-def zigzag(df: pd.DataFrame, pct: float = 0.3):
-    close = df['close'].values
-    n = len(close)
-    zz = [np.nan] * n
-    last_pivot = close[0]
-    last_type = None
-    threshold = pct / 100.0
-    for i in range(1, n):
-        change = (close[i] - last_pivot) / (last_pivot if last_pivot != 0 else 1)
-        if last_type in (None, 'low') and change >= threshold:
-            zz[i] = 1
-            last_pivot = close[i]
-            last_type = 'high'
-        elif last_type in (None, 'high') and change <= -threshold:
-            zz[i] = -1
-            last_pivot = close[i]
-            last_type = 'low'
-    return pd.Series(zz, index=df.index)
-
-# --- Signal logic ---
-def evaluate_signals(df: pd.DataFrame,
-                     zigzag_pct: float = 0.3,
-                     rsi_period: int = 14,
-                     rsi_threshold: float = 52,
-                     momentum_len: int = 10):
-    df = df.copy()
-    df['rsi'] = rsi(df['close'], period=rsi_period)
-    df['ao'] = awesome_oscillator(df)
-    df['acc'] = accelerator_oscillator(df)
-    df['mom'] = momentum(df['close'], length=momentum_len)
-    df['zz'] = zigzag(df, pct=zigzag_pct)
-
-    if len(df) < 10:
-        raise HTTPException(status_code=400, detail="Not enough data to compute signals")
-
-    i = len(df) - 1
-    prev = i - 1
-    prev2 = i - 2
-
-    latest = df.iloc[i]
-    prev_row = df.iloc[prev]
-    prev2_row = df.iloc[prev2]
-
-    zz_recent = df['zz'].iloc[-3:]
-    zigzag_upper = zz_recent.isin([1]).any()
-    zigzag_lower = zz_recent.isin([-1]).any()
-
-    acc_flip_up = (prev_row['acc'] < 0) and (latest['acc'] > 0) and (latest['close'] > latest['open'])
-    acc_flip_down = (prev_row['acc'] > 0) and (latest['acc'] < 0) and (latest['close'] < latest['open'])
-
-    rsi_up = (latest['rsi'] > prev_row['rsi']) and (latest['rsi'] >= rsi_threshold)
-
-    # --- Example signal logic ---
-    signal = None
-    if acc_flip_up and rsi_up and zigzag_lower:
+    # Signal logic
+    signal = "HOLD"
+    if acc_flip_up and momentum_up and rsi_up and zz_direction == "UP":
         signal = "BUY"
-    elif acc_flip_down and not rsi_up and zigzag_upper:
+    elif acc_flip_down and momentum_down and rsi_down and zz_direction == "DOWN":
         signal = "SELL"
 
     return {
         "signal": signal,
-        "latest_close": latest["close"],
-        "rsi": latest["rsi"],
-        "ao": latest["ao"],
-        "acc": latest["acc"],
-        "momentum": latest["mom"]
+        "ao": float(latest["ao"]),
+        "momentum": float(latest["mom"]),
+        "rsi": float(latest["rsi"]),
+        "zigzag": zz_direction,
+        "price": float(latest["close"])
     }
 
-# --- FastAPI Endpoint ---
-@app.get("/batch_signals")
-def batch_signals(symbols: str = Query(..., description="Comma-separated symbols, e.g. EUR/USD,GBP/USD")):
-    symbol_list = [s.strip() for s in symbols.split(",")]
-    results = {}
-
-    for sym in symbol_list:
-        try:
-            df = fetch_td_series(sym)
-            sig = evaluate_signals(df)
-            results[sym] = sig
-        except Exception as e:
-            results[sym] = {"error": str(e)}
-
-    return results
+# === API ENDPOINT ===
+@app.get("/signal")
+def get_signal(symbol: str = Query(...), interval: str = Query("1min")):
+    df = fetch_data(symbol, interval)
+    signal_data = generate_signal(df)
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "signal": signal_data["signal"],
+        "details": signal_data
+    }
